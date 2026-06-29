@@ -1,0 +1,262 @@
+version: "3.9"
+
+# ==============================================================================
+# CONVENTION DE CLONAGE DES REPOS
+# Tous les repos doivent être clonés côte à côte dans le même dossier parent :
+#
+#   parent/
+#   ├── marketplace-infra/           ← ce repo (docker-compose.yml ici)
+#   ├── marketplace-gateway-service/
+#   ├── marketplace-auth-service/
+#   ├── marketplace-product-service/
+#   ├── marketplace-stock-service/
+#   ├── marketplace-order-service/
+#   ├── marketplace-pepper-service/
+#   └── marketplace-frontend/
+# ==============================================================================
+
+services:
+
+  # ─── Bases de données ────────────────────────────────────────────────────────
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: marketplace-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-db.sh:/docker-entrypoint-initdb.d/init-db.sh:ro
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  mongodb:
+    image: mongo:4.4
+    container_name: marketplace-mongodb
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_INITDB_ROOT_USERNAME}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_INITDB_ROOT_PASSWORD}
+    volumes:
+      - mongo_data:/data/db
+    expose:
+      - "27017"
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "mongo --username $$MONGO_INITDB_ROOT_USERNAME --password $$MONGO_INITDB_ROOT_PASSWORD --authenticationDatabase admin --eval \"db.adminCommand('ping')\" || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+  redis:
+    image: redis:7-alpine
+    container_name: marketplace-redis
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─── Microservices ───────────────────────────────────────────────────────────
+
+  auth-service:
+    build:
+      context: ../marketplace-auth-service
+      dockerfile: Dockerfile
+    container_name: marketplace-auth-service
+    restart: unless-stopped
+    env_file: .env
+    environment:
+     DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/db_auth
+     REDIS_URL: redis://redis:6379
+     PEPPER1: ${PEPPER1}
+     PEPPER_SERVICE_URL: http://pepper-service:3005
+     INTERNAL_SECRET: ${INTERNAL_SECRET}
+    networks:
+      - internal
+    depends_on:
+      postgres:
+        condition: service_healthy
+    expose:
+      - "3001"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3001/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  product-service:
+    build:
+      context: ../marketplace-product-service
+      dockerfile: Dockerfile
+    container_name: marketplace-product-service
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      MONGODB_URI: mongodb://${MONGO_INITDB_ROOT_USERNAME}:${MONGO_INITDB_ROOT_PASSWORD}@mongodb:27017/marketplace?authSource=admin
+    networks:
+      - internal
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    expose:
+      - "3002"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3002/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  stock-service:
+    build:
+      context: ../marketplace-stock-service
+      dockerfile: Dockerfile
+    container_name: marketplace-stock-service
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/db_stocks
+    networks:
+      - internal
+    depends_on:
+      postgres:
+        condition: service_healthy
+    expose:
+      - "3003"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3003/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  order-service:
+    build:
+      context: ../marketplace-order-service
+      dockerfile: Dockerfile
+    container_name: marketplace-order-service
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/db_orders
+      STOCK_SERVICE_URL: http://stock-service:3003
+    networks:
+      - internal
+    depends_on:
+      postgres:
+        condition: service_healthy
+      stock-service:
+        condition: service_healthy
+    expose:
+      - "3004"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3004/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  pepper-service:
+    build:
+      context: ../marketplace-pepper-service
+      dockerfile: Dockerfile
+    container_name: marketplace-pepper-service
+    restart: unless-stopped
+    env_file: .env
+    networks:
+      - internal
+    # expose: au lieu de ports: → jamais accessible depuis l'extérieur
+    expose:
+      - "3005"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3005/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  # ─── API Gateway (seul service exposé publiquement) ──────────────────────────
+
+  gateway:
+    build:
+      context: ../marketplace-gateway-service
+      dockerfile: Dockerfile
+    container_name: marketplace-gateway
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      REDIS_URL: redis://redis:6379
+      AUTH_SERVICE_URL: http://auth-service:3001
+      PRODUCT_SERVICE_URL: http://product-service:3002
+      STOCK_SERVICE_URL: http://stock-service:3003
+      ORDER_SERVICE_URL: http://order-service:3004
+      PEPPER_SERVICE_URL: http://pepper-service:3005
+    ports:
+      - "${GATEWAY_PORT:-8080}:8080"
+    networks:
+      - public
+      - internal
+    depends_on:
+      redis:
+        condition: service_healthy
+      auth-service:
+        condition: service_healthy
+      product-service:
+        condition: service_healthy
+      stock-service:
+        condition: service_healthy
+      order-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  # ─── Frontend ─────────────────────────────────────────────────────────────────
+
+  frontend:
+    build:
+      context: ../marketplace-frontend
+      dockerfile: Dockerfile
+    container_name: marketplace-frontend
+    restart: unless-stopped
+    ports:
+      - "4200:80"
+    networks:
+      - public
+    depends_on:
+      gateway:
+        condition: service_healthy
+
+# ─── Réseaux ──────────────────────────────────────────────────────────────────
+
+networks:
+  public:
+    name: marketplace-public
+    driver: bridge
+  internal:
+    name: marketplace-internal
+    driver: bridge
+    internal: true   # ← aucun accès internet sortant depuis ce réseau
+
+# ─── Volumes persistants ──────────────────────────────────────────────────────
+
+volumes:
+  postgres_data:
+    name: marketplace-postgres-data
+  mongo_data:
+    name: marketplace-mongo-data
+  redis_data:
+    name: marketplace-redis-data
